@@ -321,9 +321,11 @@ document.addEventListener("DOMContentLoaded", () => {
                 actorHeader.className = "trace-event-actor";
                 const actorName = evt.actor === "gemma" ? "🧠 Gemma 4B" :
                                   evt.actor === "document_analyzer" ? "📄 Qwen3-VL" :
-                                  evt.actor === "coder" ? "💻 Qwen2.5-Coder" : evt.actor;
+                                  evt.actor === "coder" ? "💻 Qwen2.5-Coder" :
+                                  evt.actor === "sandbox" ? "📦 Docker Sandbox" : evt.actor;
                 
-                const timeInfo = evt.duration ? `(${evt.duration.toFixed(1)}s)` : "";
+                const timeInfo = evt.duration ? `(${evt.duration.toFixed(1)}s)` :
+                                 evt.wall_time_ms ? `(${evt.wall_time_ms.toFixed(0)}ms)` : "";
                 actorHeader.innerHTML = `<span>${actorName}</span> <span style="font-weight:normal;color:var(--text-muted)">${timeInfo}</span>`;
                 evtDiv.appendChild(actorHeader);
 
@@ -335,6 +337,10 @@ document.addEventListener("DOMContentLoaded", () => {
                     detail.textContent = `Generated Code: ${evt.snippet}`;
                 } else if (evt.action === "analyzed_content") {
                     detail.textContent = `Analyzed: ${evt.input}\nResult: ${evt.snippet}`;
+                } else if (evt.action === "executed_code") {
+                    const statusTag = evt.status ? evt.status.toUpperCase() : "DONE";
+                    const stdoutSnippet = evt.stdout_preview ? `\nStdout: ${evt.stdout_preview}` : "";
+                    detail.textContent = `[${statusTag}] Exit ${evt.exit_code} | Memory: ${evt.memory_peak_mb}MB | Attempts: ${evt.attempts}${stdoutSnippet}`;
                 } else if (evt.action === "final_synthesis") {
                     detail.textContent = `Synthesized final answer for user`;
                 } else {

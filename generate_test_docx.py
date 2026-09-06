@@ -39,6 +39,7 @@ def generate_test_docx(output_path: str):
     print(f"Created test DOCX at: {output_path}")
 
 if __name__ == "__main__":
-    out_dir = r"c:\Users\sarth\OneDrive\Desktop\sage\SAGE_Agent_Test\temp"
+    import config
+    out_dir = config.TEMP_DIR
     os.makedirs(out_dir, exist_ok=True)
     generate_test_docx(os.path.join(out_dir, "test_sample_report.docx"))

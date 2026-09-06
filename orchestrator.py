@@ -11,6 +11,9 @@ import config
 from model_manager import model_manager
 from model_client import model_client
 from document_processor import DocumentProcessor
+from code_executor.pipeline import CodeExecutionPipeline
+from code_executor.fixer import CodeFixer, RealCoder
+from code_executor.sandbox import DockerSandbox
 
 # Initialize UTF-8 safe Rich Console
 console = Console(highlight=False, legacy_windows=False)
@@ -21,6 +24,16 @@ class Orchestrator:
         self.coder_system_prompt = self._load_prompt("coder_system.txt")
         self.document_system_prompt = self._load_prompt("document_system.txt")
 
+        # Code Execution Pipeline (Docker sandbox + LLM auto-repair)
+        _sandbox = DockerSandbox(config.SANDBOX)
+        _real_coder = RealCoder(model_client, model_manager)
+        _fixer = CodeFixer(_real_coder)
+        self._code_pipeline = CodeExecutionPipeline(
+            sandbox=_sandbox,
+            fixer=_fixer,
+            max_fix_attempts=config.SANDBOX["max_fix_attempts"]
+        )
+
     def _load_prompt(self, filename: str) -> str:
         path = config.PROMPTS_DIR / filename
         if path.exists():
@@ -30,14 +43,40 @@ class Orchestrator:
 
     def _clean_json_str(self, text: str) -> str:
         text = text.strip()
-        # Strip markdown code fences if present
-        pattern = r"^```(?:json)?\s*\n?(.*?)\n?```$"
-        match = re.search(pattern, text, re.DOTALL)
-        if match:
-            text = match.group(1).strip()
+        # 1. Strip reasoning / thought tags
+        text = re.sub(r"<thought>.*?</thought>", "", text, flags=re.DOTALL).strip()
+
+        # 2. Extract from markdown code fence anywhere in text
+        fence_match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+        if fence_match:
+            candidate = fence_match.group(1).strip()
+            if candidate.startswith("{") and candidate.endswith("}"):
+                return candidate
+
+        # 3. Extract JSON object containing "type": "tool_calls" | "final"
+        obj_match = re.search(r"(\{\s*\"type\"\s*:\s*\"(?:tool_calls|final)\".*?\})", text, re.DOTALL)
+        if obj_match:
+            return obj_match.group(1).strip()
+
+        # 4. Fallback to balanced outermost braces
+        start_idx = text.find("{")
+        end_idx = text.rfind("}")
+        if start_idx != -1 and end_idx > start_idx:
+            return text[start_idx:end_idx + 1].strip()
+
         return text
 
     def _parse_gemma_json(self, raw_text: str) -> Optional[Dict[str, Any]]:
+        # Try direct parse first
+        try:
+            data = json.loads(raw_text.strip())
+            if isinstance(data, dict) and "type" in data:
+                if data["type"] in ["tool_calls", "final"]:
+                    return data
+        except Exception:
+            pass
+
+        # Clean and try again
         cleaned = self._clean_json_str(raw_text)
         try:
             data = json.loads(cleaned)
@@ -330,16 +369,65 @@ class Orchestrator:
                     elif tool_name == "coder":
                         context = call.get("context", "")
                         console.print(Panel(
-                            f"[bold]Tool:[/bold] coder\n[bold]Task:[/bold] {task}\n[bold]Context:[/bold] {context[:200]}...",
-                            title="[bold yellow]EXECUTING TOOL: CODER[/bold yellow]",
+                            f"[bold]Tool:[/bold] coder + sandbox\n[bold]Task:[/bold] {task}\n[bold]Context:[/bold] {context[:200]}...",
+                            title="[bold yellow]EXECUTING TOOL: CODER + SANDBOX[/bold yellow]",
                             border_style="yellow"
                         ))
 
-                        code_res = self._call_coder(task, context, telemetry, trace)
+                        # 1. Call Qwen2.5-Coder → raw LLM response
+                        raw_llm_response = self._call_coder(task, context, telemetry, trace)
+
+                        # 2. Extract → sandbox → auto-fix loop
+                        pipe_result = self._code_pipeline.execute(
+                            task=task,
+                            llm_response=raw_llm_response
+                        )
+                        telemetry["sandbox_executions"] = (
+                            telemetry.get("sandbox_executions", 0) + 1
+                        )
+
+                        # 3. Log the sandbox result
+                        exec_summary = (
+                            f"[{'SUCCESS' if pipe_result.succeeded else pipe_result.status.upper()}] "
+                            f"exit={pipe_result.exit_code} | "
+                            f"time={pipe_result.wall_time_ms:.0f}ms | "
+                            f"mem={pipe_result.memory_peak_mb:.1f}MB | "
+                            f"attempts={pipe_result.attempts}"
+                        )
+                        if pipe_result.stdout:
+                            exec_summary += f"\n\nSTDOUT:\n{pipe_result.stdout[:500]}"
+                        if pipe_result.stderr and not pipe_result.succeeded:
+                            exec_summary += f"\n\nSTDERR:\n{pipe_result.stderr[:300]}"
+
+                        console.print(Panel(
+                            exec_summary,
+                            title="[bold green]SANDBOX EXECUTION RESULT[/bold green]"
+                            if pipe_result.succeeded
+                            else "[bold red]SANDBOX EXECUTION FAILED[/bold red]",
+                            border_style="green" if pipe_result.succeeded else "red"
+                        ))
+
+                        trace.append({
+                            "actor": "sandbox",
+                            "action": "executed_code",
+                            "status": pipe_result.status,
+                            "exit_code": pipe_result.exit_code,
+                            "wall_time_ms": pipe_result.wall_time_ms,
+                            "memory_peak_mb": pipe_result.memory_peak_mb,
+                            "attempts": pipe_result.attempts,
+                            "stdout_preview": pipe_result.stdout[:200] if pipe_result.stdout else "",
+                        })
+
+                        # 4. Return rich result to Gemma (includes stdout, code, stats)
                         tool_results_list.append({
                             "tool": "coder",
-                            "status": "success",
-                            "result": code_res
+                            "status": pipe_result.status,
+                            "code": pipe_result.final_code,
+                            "stdout": pipe_result.stdout,
+                            "stderr": pipe_result.stderr if not pipe_result.succeeded else "",
+                            "execution_time_ms": pipe_result.wall_time_ms,
+                            "memory_mb": pipe_result.memory_peak_mb,
+                            "attempts": pipe_result.attempts,
                         })
 
                     else:
